@@ -1,12 +1,5 @@
 #!/bin/bash
 
-# ==========================================
-# WiFi Testing Suite v5.7
-# Full: bettercap + aircrack-ng auto-check
-# + gateway MAC resolve + deauth fallback
-# + handshake completeness verification
-# ==========================================
-
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BLUE='\033[0;34m'; MAGENTA='\033[0;35m'
 BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
@@ -16,6 +9,9 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HANDSHAKE_DIR="$SCRIPT_DIR/handshakes"
+
+mkdir -p "$HANDSHAKE_DIR"
 
 print_section() {
     echo -e "\n${BLUE}${BOLD}┌──────────────────────────────────────────────────────┐${NC}"
@@ -109,12 +105,8 @@ verify_handshake() {
     fi
 }
 
-# ==========================================
-# STEP 0 — Verify/Install bettercap & aircrack-ng
-# ==========================================
 print_section "STEP 0 • Tools Verification"
 
-# --- Bettercap ---
 if command -v bettercap &>/dev/null; then
     BC_VERSION=$(bettercap -version 2>&1 | head -n 1)
     print_ok "bettercap installed: ${BOLD}${BC_VERSION}${NC}"
@@ -130,7 +122,6 @@ else
     fi
 fi
 
-# --- Aircrack-ng ---
 if command -v aircrack-ng &>/dev/null; then
     AC_VERSION=$(aircrack-ng --version 2>&1 | head -n 1)
     print_ok "aircrack-ng installed: ${BOLD}${AC_VERSION}${NC}"
@@ -146,9 +137,8 @@ else
     fi
 fi
 
-# ==========================================
-# STEP 1 — Auto detect wireless adapter
-# ==========================================
+print_ok "Handshake folder ready: ${BOLD}${HANDSHAKE_DIR}${NC}"
+
 print_section "STEP 1 • Adapter Detection"
 
 mapfile -t ADAPTERS < <(
@@ -173,9 +163,6 @@ else
     IFACE="${ADAPTERS[$((CHOICE-1))]}"
 fi
 
-# ==========================================
-# STEP 2 — Main menu
-# ==========================================
 print_section "STEP 2 • Select Mode"
 
 echo -e "  ${CYAN}[1]${NC} MITM Attack       ${DIM}(scan LAN, show IP list, select target)${NC}"
@@ -184,9 +171,6 @@ echo -e "  ${CYAN}[3]${NC} Exit"
 echo
 read -p "$(echo -e "${MAGENTA}➜${NC} Option [1-3]: ")" MODE
 
-# ==========================================
-# MODE 1 — MITM (IP List)
-# ==========================================
 if [[ "$MODE" == "1" ]]; then
     print_section "MITM Mode • Network Discovery"
 
@@ -307,9 +291,6 @@ if [[ "$MODE" == "1" ]]; then
     echo 0 > /proc/sys/net/ipv4/ip_forward
     print_ok "IP Forwarding disabled."
 
-# ==========================================
-# MODE 2 — Handshake (verify completeness)
-# ==========================================
 elif [[ "$MODE" == "2" ]]; then
     print_section "Handshake Mode • WiFi Scan"
 
@@ -367,15 +348,17 @@ elif [[ "$MODE" == "2" ]]; then
 
     print_ok "Target: ${BOLD}${TARGET_ESSID}${NC} (${TARGET_BSSID}) Ch ${TARGET_CHANNEL}"
 
+    SAFE_ESSID=$(echo "$TARGET_ESSID" | tr -c 'A-Za-z0-9_-' '_')
+
     print_section "Handshake Save Location"
-    echo -e "  ${CYAN}[1]${NC} Script ke folder mein: ${BOLD}${SCRIPT_DIR}/handshake.pcap${NC}"
-    echo -e "  ${CYAN}[2]${NC} /root/handshake.pcap (purana default)"
+    echo -e "  ${CYAN}[1]${NC} ${BOLD}${HANDSHAKE_DIR}/${SAFE_ESSID}.pcap${NC} (default)"
+    echo -e "  ${CYAN}[2]${NC} /root/${SAFE_ESSID}.pcap"
     echo
     read -p "$(echo -e "${MAGENTA}➜${NC} Choice [1-2, default 1]: ")" PATH_CHOICE
 
     case "$PATH_CHOICE" in
-        2) HS_FILE="/root/handshake.pcap" ;;
-        *) HS_FILE="$SCRIPT_DIR/handshake.pcap" ;;
+        2) HS_FILE="/root/${SAFE_ESSID}.pcap" ;;
+        *) HS_FILE="$HANDSHAKE_DIR/${SAFE_ESSID}.pcap" ;;
     esac
 
     rm -f "$HS_FILE"
@@ -452,9 +435,6 @@ elif [[ "$MODE" == "2" ]]; then
         echo -e "    ${DIM}• Adapter does not support monitor mode + injection${NC}"
     fi
 
-# ==========================================
-# MODE 3 — Exit
-# ==========================================
 elif [[ "$MODE" == "3" ]]; then
     print_info "Exiting."
     exit 0
