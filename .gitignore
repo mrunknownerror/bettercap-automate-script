@@ -1,0 +1,5 @@
+*.pcap
+*.cap
+*.pcapng
+*.log
+handshakes/
