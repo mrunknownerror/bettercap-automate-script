@@ -1,22 +1,21 @@
 Bettercap Automate Script
 
 A Bash automation script for WiFi security testing on your own networks.
-Combines Bettercap and Aircrack-ng into a single interactive workflow.
+Combines Bettercap, Aircrack-ng, and mitmproxy into a single interactive workflow.
 
 
 FEATURES
 
 - Auto-detects wireless adapter
-- Auto-installs bettercap & aircrack-ng if missing
-- Handshake Capture: scans networks, lists ESSID + channel, auto deauth
-- MITM test: scans LAN, lists IP + MAC, ARP spoof + sniff
-- Credentials capture: extracts username/password from HTTP and HTTPS traffic
-  using a Bettercap proxy hook script (credential_hook.js)
-- Gateway MAC force-resolve (fixes "Could not find mac for gateway")
-- Target MAC warm-up before ARP spoof
-- Handshake completeness verification (aircrack-ng + tshark EAPOL count)
-- Saves handshake file by ESSID name (e.g., ZAIN_4G.pcap)
-- Saves captured credentials to credentials.txt in the script folder
+- Auto-installs bettercap, aircrack-ng, mitmproxy if missing
+- MITM Attack: ARP spoof + sniff + credential capture
+- Handshake Capture: scans WiFi, captures EAPOL, verifies completeness
+- URL Redirect: ARP spoof + mitmdump + iptables + auto HTTP server
+- Auto gateway detection (ip route, /proc/net/route, arp fallback)
+- Multi-IP detection (192.168.x.x with user selection)
+- Credentials saved to credentials.txt
+- Handshake saved by ESSID name (e.g., ZAIN_4G.pcap)
+- Automatic cleanup on exit (iptables, IP forwarding, background processes)
 
 
 REQUIREMENTS
@@ -24,8 +23,9 @@ REQUIREMENTS
 - Kali Linux (or any Debian-based distro)
 - Root privileges
 - Wireless adapter supporting monitor mode + packet injection
-- bettercap, aircrack-ng (auto-installed if missing)
+- bettercap, aircrack-ng, mitmdump (auto-installed if missing)
 - Optional: tshark, arping
+- Python 3 (for HTTP server and mitmproxy addons)
 
 
 INSTALLATION
@@ -41,47 +41,62 @@ sudo ./bettercap-automate-script.sh
 
 Follow the interactive menu:
 
-1. MITM Attack       - scan LAN, select target IP, ARP spoof + sniff
-2. Handshake Capture - scan WiFi, select ESSID, capture + verify handshake
-3. Exit
+1. MITM Attack       - ARP spoof + sniff + credential capture
+2. Handshake Capture - scan WiFi, capture + verify handshake
+3. URL Redirect      - ARP spoof + mitmdump + iptables
+4. Exit
 
 
-HANDSHAKE CAPTURE FLOW
+MODE 1 - MITM ATTACK
 
 1. Adapter auto-detected
-2. WiFi scan (20s) gives ESSID + channel list
-3. Select target network
-4. Attempt 1: PMKID via wifi.assoc (clientless)
-5. Attempt 2: wifi.deauth fallback (needs a connected client)
-6. Verify with aircrack-ng: reports WPA (N handshake)
-7. Verify with tshark: reports EAPOL frame count
-8. File saved as handshakes/<ESSID>.pcap
+2. Gateway auto-detected (with manual fallback)
+3. Network probe (25s) lists all hosts
+4. Select target IP
+5. ARP spoof + credential capture starts
+6. Credentials saved to credentials.txt
+7. Press Ctrl+C to stop
+
+Note: HTTPS credential capture requires sslstrip, which may fail
+on HSTS-enabled sites. HTTP login forms work reliably.
 
 
-MITM + CREDENTIALS FLOW
+MODE 2 - HANDSHAKE CAPTURE
 
-1. Adapter auto-detected, gateway MAC force-resolved
-2. Network probe (25s) lists IP + MAC
-3. Select target IP
-4. Target MAC force-resolved
-5. ARP spoof + net.sniff started
-6. https.proxy with sslstrip enabled
-7. credential_hook.js parses HTTP POST body and GET query
-8. If credentials found: saved to credentials.txt and printed to terminal
-9. If no credentials: script reports possible reasons
+1. WiFi scan (20s) lists ESSID + channel
+2. Select target network
+3. Attempt 1: PMKID via wifi.assoc (clientless)
+4. Attempt 2: wifi.deauth fallback (requires connected client)
+5. Verify with aircrack-ng and tshark
+6. File saved as handshakes/<ESSID>.pcap
 
 
-CREDENTIALS CAPTURE NOTES
+MODE 3 - URL REDIRECT
 
-- The hook script (credential_hook.js) is auto-generated with a dynamic path.
-- Credentials are saved to credentials.txt in the script's own folder.
-- Field names recognized: user, username, login, email, account,
-  pass, password, passwd, pwd, passcode.
-- HTTPS capture depends on sslstrip and may fail if:
-  * The target uses HSTS (HTTP Strict Transport Security)
-  * The browser blocks SSL stripping
-  * Bettercap's sslstrip has known limitations
-- For best results, clear target browser cache and HSTS data before testing.
+1. Gateway auto-detected
+2. Your IP auto-detected (multiple 192.168.x.x prompts selection)
+3. Network probe (25s) lists all hosts
+4. Select target IP
+5. Enter redirect file path (e.g., fake.html or /home/user/fake.html)
+6. Script auto-generates redirect_addon.py
+7. HTTP server auto-starts on port 80 (if free)
+8. iptables redirect (80/443 -> 8080)
+9. mitmdump starts
+10. bettercap ARP spoof starts
+11. Victim's HTTP requests redirect to your file
+
+Note: File extensions (.exe, .zip, .pdf, .apk) are NOT redirected,
+so downloads still work. HTTPS sites are not redirected unless
+mitmproxy CA certificate is installed on the victim.
+
+
+AUTO CLEANUP
+
+The script automatically cleans up on exit (Ctrl+C or normal):
+- Kills mitmdump, bettercap, HTTP server
+- Removes iptables nat rules
+- Disables IP forwarding
+- Uses a CLEANUP_DONE flag to prevent duplicate cleanup
 
 
 TROUBLESHOOTING
@@ -109,10 +124,16 @@ Fix: Check the following:
   * Inspect pcap: /tmp/mitm_capture.pcap
     (Wireshark filter: http.request.method == "POST")
 
-Problem: https.proxy not working
-Fix: Bettercap's sslstrip has known limitations with modern browsers.
-     HSTS-enabled sites cannot be stripped. This is a tool limitation,
-     not a script bug.
+Problem: Port 80 already in use
+Fix: Script detects this and uses the existing server, or
+     run: sudo ss -tulpen | grep :80 to find the process
+
+Problem: 502 Bad Gateway on redirect
+Fix: HTTP server not running or file not found. Ensure the
+     file exists and port 80 is free.
+
+Problem: Multiple 192.168.x.x IPs
+Fix: Script prompts you to select which IP to use for redirect
 
 
 LEGAL DISCLAIMER

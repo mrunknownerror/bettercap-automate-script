@@ -1,5 +1,13 @@
 *.pcap
-*.cap
 *.pcapng
+*.cap
 *.log
+credentials.txt
+credential_hook.js
+redirect_addon.py
+file_message_addon.py
 handshakes/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store

